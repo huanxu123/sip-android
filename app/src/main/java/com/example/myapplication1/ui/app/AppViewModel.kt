@@ -1,277 +1,147 @@
 package com.example.myapplication1.ui.app
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.myapplication1.data.repository.CommunicationRepository
 import com.example.myapplication1.data.repository.FakeCommunicationRepository
-import com.example.myapplication1.data.transport.ChatTransport
-import com.example.myapplication1.data.transport.FakeChatTransport
-import com.example.myapplication1.data.transport.IncomingTransportMessage
-import com.example.myapplication1.data.transport.InteropMessagePayload
-import com.example.myapplication1.data.transport.TransportAck
+import com.example.myapplication1.data.transport.SipEventListener
+import com.example.myapplication1.data.transport.SipManager
 import com.example.myapplication1.domain.model.AuthorRole
 import com.example.myapplication1.domain.model.ChatMessage
-import com.example.myapplication1.domain.model.ConversationSummary
 import com.example.myapplication1.domain.model.MessageDeliveryStatus
 import com.example.myapplication1.domain.model.MessageKind
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 
-class AppViewModel(
-    private val repository: CommunicationRepository = FakeCommunicationRepository(),
-    private val transport: ChatTransport = FakeChatTransport()
-) : ViewModel() {
+class AppViewModel : ViewModel() {
 
-    private val _uiState = MutableStateFlow(AppUiState())
-    val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
+    private val repository = FakeCommunicationRepository()
+
+    private val _uiState = MutableStateFlow(AppUiState(
+        conversations = repository.loadConversations(),
+        messages = repository.loadMessages()
+    ))
+    val uiState: StateFlow<AppUiState> = _uiState
+
+    init {
+        // 设置 SIP 监听器，确保与底层通讯同步
+        SipManager.listener = object : SipEventListener {
+            override fun onCallStateChanged(state: String) {
+                Log.d("AppViewModel", "呼叫状态变更: $state")
+                _uiState.update { it.copy(transportStatus = "通话: $state") }
+            }
+
+            override fun onRegistrationStatus(success: Boolean) {
+                val status = if (success) "注册成功" else "注册失败"
+                _uiState.update { it.copy(transportStatus = "SIP: $status") }
+            }
+
+            override fun onMessageReceived(from: String, body: String) {
+                handleIncomingSipMessage(from, body)
+            }
+        }
+    }
 
     fun enterWorkspace() {
-        val conversations = repository.loadConversations()
-        _uiState.value = AppUiState(
-            isAuthenticated = true,
-            profile = repository.loadProfile(),
-            conversations = conversations,
-            contacts = repository.loadContacts(),
-            calls = repository.loadCalls(),
-            metrics = repository.loadMetrics(),
-            alerts = repository.loadAlerts(),
-            checkpoints = repository.loadCheckpoints(),
-            backendEndpoints = repository.loadBackendEndpoints(),
-            workspaceUpdates = repository.loadWorkspaceUpdates(),
-            messages = repository.loadMessages(),
-            transportStatus = "本地模拟传输已连接，可替换为真实 WebSocket/HTTP 服务。",
-            selectedConversationId = conversations.firstOrNull()?.id
-        )
-    }
-
-    fun selectConversation(conversationId: String) {
-        _uiState.update { state ->
-            state.copy(
-                selectedConversationId = conversationId,
-                messageDraft = "",
-                transportStatus = "已切换到会话：${state.conversations.firstOrNull { it.id == conversationId }?.title ?: "未知会话"}"
-            )
-        }
-    }
-
-    fun updateDraft(draft: String) {
-        _uiState.update { state ->
-            state.copy(messageDraft = draft)
-        }
-    }
-
-    fun sendTextMessage() {
-        val state = _uiState.value
-        val draft = state.messageDraft.trim()
-        if (draft.isEmpty()) {
-            return
-        }
-        startOutboundMessage(kind = MessageKind.TEXT, body = draft, clearDraft = true)
-    }
-
-    fun sendMediaPlaceholder(kind: MessageKind) {
-        startOutboundMessage(
-            kind = kind,
-            body = when (kind) {
-                MessageKind.TEXT -> "本地文本占位"
-                MessageKind.IMAGE -> "已选择图片：机房拓扑图.png"
-                MessageKind.AUDIO -> "已录制语音：语音消息.m4a"
-                MessageKind.VIDEO -> "已选择视频：联调演示.mp4"
-            },
-            clearDraft = false
-        )
-    }
-
-    private fun startOutboundMessage(
-        kind: MessageKind,
-        body: String,
-        clearDraft: Boolean
-    ) {
-        val snapshot = _uiState.value
-        val payload = buildPayload(snapshot, kind, body) ?: return
-        _uiState.update { state ->
-            appendPendingMessage(
-                state = state,
-                payload = payload,
-                clearDraft = clearDraft
-            )
-        }
-
-        viewModelScope.launch {
-            runCatching {
-                val ack = transport.send(payload)
-                val reply = transport.awaitIncomingReply(payload)
-                ack to reply
-            }.onSuccess { (ack, reply) ->
-                _uiState.update { state ->
-                    applyAck(state, payload.conversationId, ack)
-                }
-                _uiState.update { state ->
-                    applyIncomingReply(state, reply)
-                }
-            }.onFailure {
-                _uiState.update { state ->
-                    markFailed(
-                        state = state,
-                        conversationId = payload.conversationId,
-                        messageId = payload.messageId,
-                        reason = "发送失败：${it.message ?: "未知错误"}"
-                    )
-                }
+        _uiState.update { it.copy(isAuthenticated = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 10.0.2.15 为模拟器 IP, 10.0.2.2 为宿主机 IP
+                SipManager.initSipStack("10.0.2.15")
+                SipManager.register("102", "10.0.2.2")
+            } catch (e: Exception) {
+                Log.e("AppViewModel", "SIP 初始化失败: ${e.message}")
             }
         }
     }
 
-    private fun buildPayload(
-        state: AppUiState,
-        kind: MessageKind,
-        body: String
-    ): InteropMessagePayload? {
-        val conversation = state.selectedConversation ?: return null
-        return InteropMessagePayload(
-            messageId = "msg-${System.currentTimeMillis()}",
-            conversationId = conversation.id,
-            senderId = state.profile?.sipAccount ?: "sip:android@local",
-            senderClient = state.profile?.currentUserName ?: "安卓客户端",
-            receiverLabel = conversation.title,
-            kind = kind,
-            content = body,
-            timestampLabel = "刚刚"
-        )
+    fun selectConversation(vararg args: Any?) {
+        val id = args.firstOrNull() as? String
+        if (id != null) {
+            _uiState.update { it.copy(selectedConversationId = id) }
+        }
     }
 
-    private fun appendPendingMessage(
-        state: AppUiState,
-        payload: InteropMessagePayload,
-        clearDraft: Boolean
-    ): AppUiState {
-        val existingMessages = state.messages[payload.conversationId].orEmpty()
-        val pendingMessage = ChatMessage(
-            id = payload.messageId,
-            author = payload.senderClient,
-            authorRole = AuthorRole.SELF,
-            kind = payload.kind,
-            body = payload.content,
-            timestamp = payload.timestampLabel,
-            deliveryStatus = MessageDeliveryStatus.SENDING
-        )
-        return state.copy(
-            conversations = state.conversations.updateConversationSummary(
-                conversationId = payload.conversationId,
-                preview = "我：${payload.content}",
-                kind = payload.kind,
-                timestamp = "刚刚",
-                unreadCount = 0
-            ),
-            messages = state.messages + (payload.conversationId to (existingMessages + pendingMessage)),
-            messageDraft = if (clearDraft) "" else state.messageDraft,
-            transportStatus = "正在发送${payload.kind.toChineseLabel()}消息到 ${payload.receiverLabel}"
-        )
-    }
+    // 实现真正的文字消息发送
+    fun sendTextMessage(vararg args: Any?) {
+        val draft = uiState.value.messageDraft
+        val currentConversationId = uiState.value.selectedConversationId ?: "103"
 
-    private fun applyAck(
-        state: AppUiState,
-        conversationId: String,
-        ack: TransportAck
-    ): AppUiState {
-        val updatedMessages = state.messages[conversationId].orEmpty().map { message ->
-            if (message.id == ack.messageId) {
-                message.copy(
-                    timestamp = ack.deliveredAt,
-                    deliveryStatus = MessageDeliveryStatus.SENT
+        if (draft.isNotBlank()) {
+            val now = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+            
+            // 构造符合项目定义的 ChatMessage
+            val newMessage = ChatMessage(
+                id = UUID.randomUUID().toString(),
+                author = "me",
+                authorRole = AuthorRole.SELF,
+                kind = MessageKind.TEXT,
+                body = draft,
+                timestamp = now,
+                deliveryStatus = MessageDeliveryStatus.SENT
+            )
+
+            // 更新 UI
+            _uiState.update { state ->
+                val conversationMessages = state.messages[currentConversationId].orEmpty().toMutableList()
+                conversationMessages.add(newMessage)
+                state.copy(
+                    messages = state.messages + (currentConversationId to conversationMessages),
+                    messageDraft = "" // 发送后清空草稿
                 )
-            } else {
-                message
+            }
+
+            // 调用底层的 SIP 发送
+            viewModelScope.launch(Dispatchers.IO) {
+                SipManager.sendMessage(to = currentConversationId, server = "10.0.2.2", body = draft)
             }
         }
-        return state.copy(
-            messages = state.messages + (conversationId to updatedMessages),
-            transportStatus = ack.serverMessage
-        )
     }
 
-    private fun applyIncomingReply(
-        state: AppUiState,
-        reply: IncomingTransportMessage
-    ): AppUiState {
-        val markedMessages = state.messages[reply.conversationId].orEmpty().map { message ->
-            if (message.id == reply.replyToMessageId) {
-                message.copy(deliveryStatus = MessageDeliveryStatus.DELIVERED)
+    // 媒体测试按钮：处理呼叫与挂断切换
+    fun sendMediaPlaceholder(vararg args: Any?) {
+        val currentStatus = uiState.value.transportStatus
+        viewModelScope.launch(Dispatchers.IO) {
+            if (currentStatus.contains("CONNECTED") || currentStatus.contains("RINGING") || currentStatus.contains("CALLING")) {
+                SipManager.hangup()
             } else {
-                message
+                // 默认呼叫 103 (网页端)
+                SipManager.makeCall(caller = "102", callee = "103", server = "10.0.2.2")
             }
         }
-        val incomingMessage = ChatMessage(
-            id = "remote-${System.currentTimeMillis()}",
-            author = reply.senderLabel,
+    }
+
+    private fun handleIncomingSipMessage(from: String, body: String) {
+        val now = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+        val senderUser = from.substringAfter("sip:").substringBefore("@")
+        val conversationId = senderUser.ifEmpty { "103" }
+
+        val incomingMsg = ChatMessage(
+            id = UUID.randomUUID().toString(),
+            author = senderUser,
             authorRole = AuthorRole.REMOTE,
-            kind = reply.kind,
-            body = reply.content,
-            timestamp = reply.timestampLabel,
+            kind = MessageKind.TEXT,
+            body = body,
+            timestamp = now,
             deliveryStatus = MessageDeliveryStatus.DELIVERED
         )
-        return state.copy(
-            conversations = state.conversations.updateConversationSummary(
-                conversationId = reply.conversationId,
-                preview = reply.content,
-                kind = reply.kind,
-                timestamp = reply.timestampLabel,
-                unreadCount = 0
-            ),
-            messages = state.messages + (reply.conversationId to (markedMessages + incomingMessage)),
-            transportStatus = "收到 ${reply.senderLabel} 的回执消息"
-        )
-    }
 
-    private fun markFailed(
-        state: AppUiState,
-        conversationId: String,
-        messageId: String,
-        reason: String
-    ): AppUiState {
-        val updatedMessages = state.messages[conversationId].orEmpty().map { message ->
-            if (message.id == messageId) {
-                message.copy(deliveryStatus = MessageDeliveryStatus.FAILED)
-            } else {
-                message
-            }
-        }
-        return state.copy(
-            messages = state.messages + (conversationId to updatedMessages),
-            transportStatus = reason
-        )
-    }
-
-    private fun List<ConversationSummary>.updateConversationSummary(
-        conversationId: String,
-        preview: String,
-        kind: MessageKind,
-        timestamp: String,
-        unreadCount: Int
-    ): List<ConversationSummary> {
-        return map { conversation ->
-            if (conversation.id == conversationId) {
-                conversation.copy(
-                    preview = preview,
-                    kind = kind,
-                    timestamp = timestamp,
-                    unreadCount = unreadCount
-                )
-            } else {
-                conversation
-            }
+        _uiState.update { state ->
+            val conversationMessages = state.messages[conversationId].orEmpty().toMutableList()
+            conversationMessages.add(incomingMsg)
+            state.copy(messages = state.messages + (conversationId to conversationMessages))
         }
     }
 
-    private fun MessageKind.toChineseLabel(): String {
-        return when (this) {
-            MessageKind.TEXT -> "文本"
-            MessageKind.IMAGE -> "图片"
-            MessageKind.AUDIO -> "语音"
-            MessageKind.VIDEO -> "视频"
-        }
+    fun updateDraft(vararg args: Any?) {
+        val newDraft = args.firstOrNull() as? String ?: ""
+        _uiState.update { it.copy(messageDraft = newDraft) }
     }
 }
